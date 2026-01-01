@@ -2,8 +2,8 @@ import argparse
 import datetime as dt
 import json
 import math
-import time
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterable
 
@@ -163,7 +163,7 @@ def get_pool_tokens_and_decimals(w3: Web3, pool: str) -> dict[str, Any]:
     }
 
 
-def decode_swap_log(w3: Web3, log: dict) -> dict[str, Any]:
+def decode_swap_sqrt_price_x96(w3: Web3, log: dict) -> int:
     data_field = log["data"]
     if isinstance(data_field, (bytes, bytearray)):
         data = bytes(data_field)
@@ -175,13 +175,7 @@ def decode_swap_log(w3: Web3, log: dict) -> dict[str, Any]:
 
     types = ["int256", "int256", "uint160", "uint128", "int24"]
     _, _, sqrtPriceX96, _, _ = w3.codec.decode(types, data)
-
-    return {
-        "block_number": int(log["blockNumber"]),
-        "log_index": int(log["logIndex"]),
-        "tx_hash": log["transactionHash"].hex(),
-        "sqrtPriceX96": int(sqrtPriceX96),
-    }
+    return int(sqrtPriceX96)
 
 
 def sqrtprice_to_price_token1_per_token0(sqrt_price_x96: int) -> float:
@@ -211,10 +205,10 @@ def price_quote_per_base_from_pool_price(
     if base == token1 and quote == token0:
         return 1.0 / price_token1_per_token0_human
 
-    raise RuntimeError("Unexpected token ordering")
+    raise RuntimeError("Unexpected token ordering for base/quote vs pool token0/token1")
 
 
-def pull_raw_swaps(
+def pull_raw_swaps_minimal(
     w3: Web3,
     *,
     pool: str,
@@ -252,15 +246,14 @@ def pull_raw_swaps(
             }
         )
 
-        for log in logs:
-            d = decode_swap_log(w3, log)
-
-            bn = d["block_number"]
+        for lg in logs:
+            bn = int(lg["blockNumber"])
             if bn not in ts_cache:
                 ts_cache[bn] = int(w3.eth.get_block(bn)["timestamp"])
             ts = ts_cache[bn]
 
-            raw_price = sqrtprice_to_price_token1_per_token0(d["sqrtPriceX96"])
+            sqrt_price_x96 = decode_swap_sqrt_price_x96(w3, lg)
+            raw_price = sqrtprice_to_price_token1_per_token0(sqrt_price_x96)
             human_price = adjust_for_decimals(raw_price, dec0, dec1)
             quote_per_base = price_quote_per_base_from_pool_price(
                 price_token1_per_token0_human=human_price,
@@ -274,9 +267,7 @@ def pull_raw_swaps(
                 {
                     "timestamp": int(ts),
                     "block_number": bn,
-                    "log_index": d["log_index"],
-                    "tx_hash": d["tx_hash"],
-                    "price_quote_per_base": float(quote_per_base),
+                    "log_index": int(lg["logIndex"]),
                     "log_price": float(math.log(quote_per_base)),
                 }
             )
@@ -294,8 +285,6 @@ def pull_raw_swaps(
     df["timestamp"] = df["timestamp"].astype("int64")
     df["block_number"] = df["block_number"].astype("int64")
     df["log_index"] = df["log_index"].astype("int64")
-    df["tx_hash"] = df["tx_hash"].astype("string")
-    df["price_quote_per_base"] = df["price_quote_per_base"].astype("float64")
     df["log_price"] = df["log_price"].astype("float64")
 
     return df
@@ -304,11 +293,22 @@ def pull_raw_swaps(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pair", choices=["usdc_weth", "wbtc_weth"], required=True)
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
+    parser.add_argument("--start", required=True, help="YYYY-MM-DD (UTC, inclusive)")
+    parser.add_argument("--end", required=True, help="YYYY-MM-DD (UTC, exclusive)")
     parser.add_argument("--fee", type=int, default=500)
     parser.add_argument("--chunk-size", type=int, default=50_000)
+    parser.add_argument(
+        "--out-dir", default="data", help="Directory to write parquet/csv outputs"
+    )
+    parser.add_argument(
+        "--write-csv",
+        action="store_true",
+        help="Also write CSV (Parquet is canonical).",
+    )
     args = parser.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     rpc_url = get_arb_rpc_url()
     w3 = Web3(Web3.HTTPProvider(rpc_url))
@@ -327,7 +327,7 @@ def main() -> None:
 
     pool = find_pool_for_fee(w3, base, quote, args.fee)
     if int(pool, 16) == 0:
-        raise RuntimeError("Pool not found")
+        raise RuntimeError("Pool not found. Check fee tier / token addresses.")
 
     print("Using fee", args.fee, "pool", pool)
 
@@ -337,10 +337,17 @@ def main() -> None:
     start_block = find_block_by_timestamp(w3, utc_ts(start_dt), side="right")
     end_block = find_block_by_timestamp(w3, utc_ts(end_dt), side="left")
 
-    print("start_block:", start_block, "end_block:", end_block)
+    print(
+        "start_block:",
+        start_block,
+        "end_block:",
+        end_block,
+        "block_span:",
+        end_block - start_block + 1,
+    )
 
-    print("\nPulling raw swaps...")
-    df = pull_raw_swaps(
+    print("\nPulling raw swaps (minimal schema)...")
+    df = pull_raw_swaps_minimal(
         w3,
         pool=pool,
         base_token=base,
@@ -350,15 +357,25 @@ def main() -> None:
         chunk_size=args.chunk_size,
     )
 
-    out_prefix = f"{args.pair}_raw_{args.start}_to_{args.end}"
-    df.to_parquet(out_prefix + ".parquet", index=False)
-    df.to_csv(out_prefix + ".csv", index=False)
+    out_prefix = f"{args.pair}_raw_minimal_fee{args.fee}_{args.start}_to_{args.end}"
+    out_parquet = out_dir / (out_prefix + ".parquet")
+    out_csv = out_dir / (out_prefix + ".csv")
+
+    print("\nWriting:", out_parquet.as_posix())
+    df.to_parquet(out_parquet, index=False)
+
+    if args.write_csv:
+        print("Writing:", out_csv.as_posix())
+        df.to_csv(out_csv, index=False)
 
     print("\nDone.")
     print("rows:", len(df))
     if len(df) > 0:
         print(
-            "first ts:", df["timestamp"].iloc[0], "last ts:", df["timestamp"].iloc[-1]
+            "first ts:",
+            int(df["timestamp"].iloc[0]),
+            "last ts:",
+            int(df["timestamp"].iloc[-1]),
         )
 
 
