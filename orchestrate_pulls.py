@@ -1,19 +1,3 @@
-"""
-orchestrate_pulls.py
-
-Sequentially runs weekly pulls for 4 months (default: Jan-Apr 2024) for:
-  - usdc_weth
-  - wbtc_weth
-
-It does NOT merge anything. It just leaves you with weekly parquet files, e.g.:
-
-dataset_out/usdc_weth/weekly/usdc_weth_raw_minimal_fee500_2024-01-01_to_2024-01-08.parquet
-dataset_out/wbtc_weth/weekly/wbtc_weth_raw_minimal_fee500_2024-01-01_to_2024-01-08.parquet
-...
-
-It is resume-safe: if a weekly output already exists, it skips it.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -26,7 +10,11 @@ from pathlib import Path
 EXTRACTOR_SCRIPT = "pull_raw_pair_arbitrum_uniswapv3.py"
 DEFAULT_FEE = 500
 DEFAULT_CHUNK_SIZE = 50_000
+DEFAULT_MIN_SPAN = 2_000
+
+# For your “start with 4 months” plan
 DEFAULT_MONTHS = ["2024-01", "2024-02", "2024-03", "2024-04"]
+
 PAIRS = ["usdc_weth", "wbtc_weth"]
 
 
@@ -45,6 +33,9 @@ def month_start_end(year: int, month: int) -> tuple[dt.date, dt.date]:
 
 
 def split_into_weeks(start: dt.date, end: dt.date) -> list[tuple[dt.date, dt.date]]:
+    """
+    Split [start, end) into 7-day chunks. Last chunk may be shorter.
+    """
     out: list[tuple[dt.date, dt.date]] = []
     cur = start
     while cur < end:
@@ -65,6 +56,7 @@ class RunSpec:
     end: dt.date
     fee: int
     chunk_size: int
+    min_span: int
     out_dir: Path
 
 
@@ -75,7 +67,7 @@ def expected_output_path(spec: RunSpec) -> Path:
     return spec.out_dir / name
 
 
-def run_extractor(spec: RunSpec) -> None:
+def run_extractor_if_needed(spec: RunSpec) -> None:
     spec.out_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = expected_output_path(spec)
@@ -99,6 +91,8 @@ def run_extractor(spec: RunSpec) -> None:
         str(spec.fee),
         "--chunk-size",
         str(spec.chunk_size),
+        "--min-span",
+        str(spec.min_span),
         "--out-dir",
         spec.out_dir.as_posix(),
     ]
@@ -117,6 +111,10 @@ def main() -> None:
     parser.add_argument("--root-out", default="dataset_out")
     parser.add_argument("--fee", type=int, default=DEFAULT_FEE)
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--min-span", type=int, default=DEFAULT_MIN_SPAN)
+    parser.add_argument(
+        "--pairs", nargs="*", default=PAIRS, help="Override which pairs to run"
+    )
     args = parser.parse_args()
 
     extractor_path = Path(EXTRACTOR_SCRIPT).resolve()
@@ -127,7 +125,7 @@ def main() -> None:
     root_out = Path(args.root_out).resolve()
     root_out.mkdir(parents=True, exist_ok=True)
 
-    for pair in PAIRS:
+    for pair in args.pairs:
         weekly_dir = root_out / pair / "weekly"
         weekly_dir.mkdir(parents=True, exist_ok=True)
 
@@ -147,9 +145,10 @@ def main() -> None:
                     end=w_end,
                     fee=args.fee,
                     chunk_size=args.chunk_size,
+                    min_span=args.min_span,
                     out_dir=weekly_dir,
                 )
-                run_extractor(spec)
+                run_extractor_if_needed(spec)
 
     print("\nAll done.")
     print(f"Weekly outputs are in: {root_out}/<pair>/weekly/")

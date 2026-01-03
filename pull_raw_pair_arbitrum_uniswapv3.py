@@ -2,6 +2,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -96,6 +97,10 @@ def parse_yyyy_mm_dd(s: str) -> dt.datetime:
 
 
 def find_block_by_timestamp(w3: Web3, target_ts: int, *, side: str) -> int:
+    """
+    side="left": greatest block with timestamp <= target_ts
+    side="right": smallest block with timestamp >= target_ts
+    """
     latest = w3.eth.get_block("latest")
     hi = int(latest["number"])
     lo = 0
@@ -118,14 +123,6 @@ def find_block_by_timestamp(w3: Web3, target_ts: int, *, side: str) -> int:
     if side == "right":
         return hi
     raise ValueError("side must be 'left' or 'right'")
-
-
-def chunk_ranges(start: int, end: int, chunk_size: int) -> Iterable[tuple[int, int]]:
-    cur = start
-    while cur <= end:
-        nxt = min(cur + chunk_size - 1, end)
-        yield cur, nxt
-        cur = nxt + 1
 
 
 def find_pool_for_fee(w3: Web3, token_a: str, token_b: str, fee: int) -> str:
@@ -208,6 +205,78 @@ def price_quote_per_base_from_pool_price(
     raise RuntimeError("Unexpected token ordering for base/quote vs pool token0/token1")
 
 
+def _looks_like_too_many_logs_error(e: Exception) -> bool:
+    msg = str(e)
+    # We’ve seen:
+    # "Log response size exceeded. ... cap of 10K logs in the response."
+    return (
+        ("Log response size exceeded" in msg)
+        or ("cap of 10K logs" in msg)
+        or ("response size exceeded" in msg)
+    )
+
+
+def get_logs_adaptive(
+    w3: Web3,
+    *,
+    address: str,
+    topic0: str,
+    from_block: int,
+    to_block: int,
+    max_block_span: int,
+    min_block_span: int = 1000,
+) -> list[tuple[int, int, list[dict]]]:
+    """
+    Returns a list of (b0, b1, logs) that together cover [from_block, to_block].
+
+    Strategy:
+    - Attempt spans up to max_block_span.
+    - If RPC errors due to log response size, halve the span and retry.
+    - If span becomes too small, we still proceed (down to min_block_span), otherwise error.
+
+    This makes the pipeline robust to Alchemy's log-count caps.
+    """
+    out: list[tuple[int, int, list[dict]]] = []
+    cur = from_block
+
+    while cur <= to_block:
+        span = min(max_block_span, to_block - cur + 1)
+        b0 = cur
+        b1 = min(cur + span - 1, to_block)
+
+        while True:
+            try:
+                logs = w3.eth.get_logs(
+                    {
+                        "fromBlock": b0,
+                        "toBlock": b1,
+                        "address": w3.to_checksum_address(address),
+                        "topics": [topic0],
+                    }
+                )
+                out.append((b0, b1, logs))
+                cur = b1 + 1
+                break
+            except Exception as e:
+                if _looks_like_too_many_logs_error(e):
+                    old_span = b1 - b0 + 1
+                    if old_span <= min_block_span:
+                        raise RuntimeError(
+                            f"eth_getLogs keeps exceeding log cap even at span={old_span} "
+                            f"for window {b0}-{b1}. Consider lowering min_block_span."
+                        ) from e
+                    new_span = max(min_block_span, old_span // 2)
+                    b1 = b0 + new_span - 1
+                    print(
+                        f"[adaptive] too many logs in {b0}-{b0 + old_span - 1} "
+                        f"-> retry with span={new_span} ({b0}-{b1})"
+                    )
+                    continue
+                raise
+
+    return out
+
+
 def pull_raw_swaps_minimal(
     w3: Web3,
     *,
@@ -217,7 +286,17 @@ def pull_raw_swaps_minimal(
     start_block: int,
     end_block: int,
     chunk_size: int = 50_000,
+    min_span: int = 2_000,
 ) -> pd.DataFrame:
+    """
+    Minimal dataset:
+      - timestamp (int64)
+      - block_number (int64)
+      - log_index (int64)
+      - log_price (float64)
+
+    Uses adaptive eth_getLogs to respect provider caps (10k logs response).
+    """
     topic0 = keccak_topic0(w3, SWAP_EVENT_SIG)
     ts_cache: dict[int, int] = {}
 
@@ -231,52 +310,65 @@ def pull_raw_swaps_minimal(
     rows: list[dict[str, Any]] = []
 
     total_blocks = end_block - start_block + 1
-    n_chunks = (total_blocks + chunk_size - 1) // chunk_size
+    est_chunks = (total_blocks + chunk_size - 1) // chunk_size
     t0 = perf_counter()
 
-    for i, (b0, b1) in enumerate(
-        chunk_ranges(start_block, end_block, chunk_size), start=1
-    ):
-        logs = w3.eth.get_logs(
-            {
-                "fromBlock": b0,
-                "toBlock": b1,
-                "address": w3.to_checksum_address(pool),
-                "topics": [topic0],
-            }
+    # We iterate over coarse chunks, but inside each we may split further.
+    coarse_idx = 0
+    cur = start_block
+
+    while cur <= end_block:
+        coarse_idx += 1
+        coarse_b0 = cur
+        coarse_b1 = min(cur + chunk_size - 1, end_block)
+
+        segments = get_logs_adaptive(
+            w3,
+            address=pool,
+            topic0=topic0,
+            from_block=coarse_b0,
+            to_block=coarse_b1,
+            max_block_span=coarse_b1 - coarse_b0 + 1,
+            min_block_span=min_span,
         )
 
-        for lg in logs:
-            bn = int(lg["blockNumber"])
-            if bn not in ts_cache:
-                ts_cache[bn] = int(w3.eth.get_block(bn)["timestamp"])
-            ts = ts_cache[bn]
+        swaps_in_coarse = 0
+        for seg_b0, seg_b1, logs in segments:
+            swaps_in_coarse += len(logs)
 
-            sqrt_price_x96 = decode_swap_sqrt_price_x96(w3, lg)
-            raw_price = sqrtprice_to_price_token1_per_token0(sqrt_price_x96)
-            human_price = adjust_for_decimals(raw_price, dec0, dec1)
-            quote_per_base = price_quote_per_base_from_pool_price(
-                price_token1_per_token0_human=human_price,
-                token0=token0,
-                token1=token1,
-                base=base_token,
-                quote=quote_token,
-            )
+            for lg in logs:
+                bn = int(lg["blockNumber"])
+                if bn not in ts_cache:
+                    ts_cache[bn] = int(w3.eth.get_block(bn)["timestamp"])
+                ts = ts_cache[bn]
 
-            rows.append(
-                {
-                    "timestamp": int(ts),
-                    "block_number": bn,
-                    "log_index": int(lg["logIndex"]),
-                    "log_price": float(math.log(quote_per_base)),
-                }
-            )
+                sqrt_price_x96 = decode_swap_sqrt_price_x96(w3, lg)
+                raw_price = sqrtprice_to_price_token1_per_token0(sqrt_price_x96)
+                human_price = adjust_for_decimals(raw_price, dec0, dec1)
+                quote_per_base = price_quote_per_base_from_pool_price(
+                    price_token1_per_token0_human=human_price,
+                    token0=token0,
+                    token1=token1,
+                    base=base_token,
+                    quote=quote_token,
+                )
+
+                rows.append(
+                    {
+                        "timestamp": int(ts),
+                        "block_number": bn,
+                        "log_index": int(lg["logIndex"]),
+                        "log_price": float(math.log(quote_per_base)),
+                    }
+                )
 
         elapsed = perf_counter() - t0
         print(
-            f"[chunk {i:>4}/{n_chunks}] blocks {b0}-{b1} | swaps={len(logs):>6} | "
-            f"rows={len(rows):>8} | elapsed={elapsed:>7.1f}s"
+            f"[coarse {coarse_idx:>4}/{est_chunks}] blocks {coarse_b0}-{coarse_b1} | "
+            f"swaps={swaps_in_coarse:>7} | rows={len(rows):>9} | elapsed={elapsed:>7.1f}s"
         )
+
+        cur = coarse_b1 + 1
 
     df = pd.DataFrame(rows)
     df.sort_values(["timestamp", "block_number", "log_index"], inplace=True)
@@ -298,20 +390,18 @@ def main() -> None:
     parser.add_argument("--fee", type=int, default=500)
     parser.add_argument("--chunk-size", type=int, default=50_000)
     parser.add_argument(
-        "--out-dir", default="data", help="Directory to write parquet/csv outputs"
+        "--min-span",
+        type=int,
+        default=2_000,
+        help="Minimum block span during adaptive splitting",
     )
-    parser.add_argument(
-        "--write-csv",
-        action="store_true",
-        help="Also write CSV (Parquet is canonical).",
-    )
+    parser.add_argument("--out-dir", default="data")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rpc_url = get_arb_rpc_url()
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    w3 = Web3(Web3.HTTPProvider(get_arb_rpc_url()))
     print("connected:", w3.is_connected(), "latest block:", w3.eth.block_number)
 
     if args.pair == "usdc_weth":
@@ -328,7 +418,6 @@ def main() -> None:
     pool = find_pool_for_fee(w3, base, quote, args.fee)
     if int(pool, 16) == 0:
         raise RuntimeError("Pool not found. Check fee tier / token addresses.")
-
     print("Using fee", args.fee, "pool", pool)
 
     start_dt = parse_yyyy_mm_dd(args.start)
@@ -336,7 +425,6 @@ def main() -> None:
 
     start_block = find_block_by_timestamp(w3, utc_ts(start_dt), side="right")
     end_block = find_block_by_timestamp(w3, utc_ts(end_dt), side="left")
-
     print(
         "start_block:",
         start_block,
@@ -346,7 +434,7 @@ def main() -> None:
         end_block - start_block + 1,
     )
 
-    print("\nPulling raw swaps (minimal schema)...")
+    print("\nPulling raw swaps (minimal schema, adaptive logs)...")
     df = pull_raw_swaps_minimal(
         w3,
         pool=pool,
@@ -355,18 +443,14 @@ def main() -> None:
         start_block=start_block,
         end_block=end_block,
         chunk_size=args.chunk_size,
+        min_span=args.min_span,
     )
 
     out_prefix = f"{args.pair}_raw_minimal_fee{args.fee}_{args.start}_to_{args.end}"
     out_parquet = out_dir / (out_prefix + ".parquet")
-    out_csv = out_dir / (out_prefix + ".csv")
 
     print("\nWriting:", out_parquet.as_posix())
     df.to_parquet(out_parquet, index=False)
-
-    if args.write_csv:
-        print("Writing:", out_csv.as_posix())
-        df.to_csv(out_csv, index=False)
 
     print("\nDone.")
     print("rows:", len(df))
