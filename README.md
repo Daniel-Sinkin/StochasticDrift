@@ -17,3 +17,8 @@ After pulling one week
 Total usage: 2M
 Current spend:
 $0.90
+
+After pulling first 4 months
+Total usage: 61.7M
+Current spend:
+$27.76
